@@ -1,7 +1,14 @@
-//! Optional same-user effect requests. No HID, scripts, or global-settings writes.
+//! Optional same-user access to temporary LED palettes. No application semantics.
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::palette::LedPalette;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+
+pub const UPDATE_INTERVAL: Duration = Duration::from_millis(125);
+#[cfg(unix)]
+const MAX_TTL_MS: u64 = 10000;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn new_session_id() -> String {
@@ -16,6 +23,23 @@ pub fn new_session_id() -> String {
     )
 }
 
+#[derive(Clone, Debug)]
+pub struct PaletteOverride {
+    pub colors: LedPalette,
+    pub expires: Instant,
+    pub connection: CancellationToken,
+}
+
+impl PaletteOverride {
+    pub fn palette(&self, base: LedPalette, now: Instant) -> LedPalette {
+        if self.connection.is_cancelled() || now >= self.expires {
+            base
+        } else {
+            self.colors
+        }
+    }
+}
+
 #[cfg(not(unix))]
 pub async fn start(_: &tokio_util::task::TaskTracker) {}
 
@@ -24,29 +48,24 @@ pub use unix::start;
 
 #[cfg(unix)]
 mod unix {
-    use crate::{
-        SESSIONS,
-        effects::{self, Effect, EffectKind, FRAME_INTERVAL, Preferences},
-    };
+    use super::*;
+    use crate::{SESSIONS, palette::parse_palette};
     use serde_json::{Value, json};
     use std::{
-        collections::HashMap,
         fs, io,
         io::Read,
         os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         path::PathBuf,
         sync::Arc,
-        time::Duration,
     };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt, BufReader},
         net::{UnixListener, UnixStream},
-        time::{Instant, sleep, timeout},
+        time::{sleep, timeout},
     };
-    use tokio_util::{sync::CancellationToken, task::TaskTracker};
+    use tokio_util::task::TaskTracker;
 
     const MAX_FRAME: usize = 1024;
-    const MAX_SESSIONS: usize = 32;
     const IDLE: Duration = Duration::from_secs(15);
     const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -71,11 +90,11 @@ mod unix {
             let metadata = fs::symlink_metadata(&directory)?;
             if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o777 != 0o700 {
                 return Err(io::Error::other(
-                    "effect directory must be owned by this user with mode 0700",
+                    "control directory must be owned by this user with mode 0700",
                 ));
             }
             let path = directory.join("led.sock");
-            // Never unlink a preexisting socket: it may belong to another live process.
+            // An existing socket may belong to another live process; never unlink it.
             let listener = UnixListener::bind(&path)?;
             let metadata = fs::symlink_metadata(&path)?;
             let endpoint = Self {
@@ -99,87 +118,68 @@ mod unix {
         }
     }
 
-    fn preferences(value: &Value) -> Result<Option<Preferences>, &'static str> {
+    fn enabled(value: &Value) -> Result<bool, &'static str> {
         let object = value.as_object().ok_or("invalid configuration")?;
-        if object
-            .keys()
-            .any(|key| !["enabled", "reduced_motion", "brightness_cap"].contains(&key.as_str()))
-        {
+        if object.keys().any(|key| key != "enabled") {
             return Err("unknown configuration field");
         }
-        let boolean = |name| -> Result<bool, &'static str> {
-            value
-                .get(name)
-                .map_or(Ok(false), |v| v.as_bool().ok_or("invalid preference"))
-        };
-        let enabled = boolean("enabled")?;
-        let reduced_motion = boolean("reduced_motion")?;
-        let cap = value
-            .get("brightness_cap")
-            .map_or(Ok(32), |v| v.as_u64().ok_or("invalid brightness"))?;
-        if cap > 64 {
-            return Err("brightness cap exceeds 64");
-        }
-        Ok(enabled.then_some(Preferences {
-            reduced_motion,
-            brightness_cap: cap as u8,
-        }))
+        value
+            .get("enabled")
+            .map_or(Ok(false), |v| v.as_bool().ok_or("enabled must be boolean"))
     }
 
-    fn load_preferences(uid: u32) -> Result<Option<Preferences>, &'static str> {
+    fn load_enabled(uid: u32) -> Result<bool, &'static str> {
         let path = std::env::current_exe()
             .map_err(|_| "executable path unavailable")?
             .parent()
             .ok_or("plugin directory unavailable")?
-            .join("led-effects.json");
+            .join("led-control.json");
         let file = match fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path)
         {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(_) => {
                 return Err(
-                    "cannot open led-effects.json (use an owned regular file, not a symlink)",
+                    "cannot open led-control.json (use an owned regular file, not a symlink)",
                 );
             }
         };
         let metadata = file
             .metadata()
-            .map_err(|_| "cannot inspect led-effects.json")?;
+            .map_err(|_| "cannot inspect led-control.json")?;
         if !metadata.is_file()
             || metadata.uid() != uid
             || metadata.mode() & 0o022 != 0
             || metadata.len() > 4096
         {
             return Err(
-                "unsafe led-effects.json (use an owned regular file, not writable by others, at most 4096 bytes)",
+                "unsafe led-control.json (use an owned regular file, not writable by others, at most 4096 bytes)",
             );
         }
         let mut bytes = Vec::new();
         file.take(4097)
             .read_to_end(&mut bytes)
-            .map_err(|_| "cannot read led-effects.json")?;
+            .map_err(|_| "cannot read led-control.json")?;
         if bytes.len() > 4096 {
-            return Err("oversized led-effects.json");
+            return Err("oversized led-control.json");
         }
-        preferences(
-            &serde_json::from_slice::<Value>(&bytes).map_err(|_| "invalid led-effects.json")?,
-        )
+        enabled(&serde_json::from_slice::<Value>(&bytes).map_err(|_| "invalid led-control.json")?)
     }
 
     pub async fn start(tracker: &TaskTracker) {
-        // SAFETY: geteuid has no preconditions and changes no process state.
+        // SAFETY: geteuid is a read-only process identity lookup.
         let uid = unsafe { libc::geteuid() };
-        let preferences = match load_preferences(uid) {
-            Ok(Some(preferences)) => preferences,
-            Ok(None) => return,
+        match load_enabled(uid) {
+            Ok(true) => {}
+            Ok(false) => return,
             Err(error) => {
-                log::error!("LED effects disabled: {}", error);
+                log::error!("External LED control disabled: {}", error);
                 return;
             }
-        };
+        }
         let endpoint = match std::env::var_os("HOME")
             .ok_or_else(|| io::Error::other("HOME unavailable"))
             .and_then(|home| Endpoint::bind(PathBuf::from(home), uid))
@@ -187,7 +187,7 @@ mod unix {
             Ok(endpoint) => endpoint,
             Err(_) => {
                 log::error!(
-                    "LED effects disabled: cannot bind private ~/.opendeck-m18/led.sock; inspect ownership/mode or an existing socket with OpenDeck closed"
+                    "External LED control disabled: cannot bind private ~/.opendeck-m18/led.sock; inspect ownership/mode or an existing socket with OpenDeck closed"
                 );
                 return;
             }
@@ -196,30 +196,21 @@ mod unix {
         SESSIONS
             .write()
             .await
-            .insert_task("_led_effects".into(), token.clone());
+            .insert_task("_led_control".into(), token.clone());
         tracker.spawn(async move {
-            log::info!("LED effect interface v1 enabled (same-user Unix socket)");
+            log::info!("External LED palette control v1 enabled");
             loop {
                 let stream = tokio::select! {
                     biased;
                     _ = token.cancelled() => break,
-                    result = endpoint.listener.accept() => match result {
-                        Ok((stream, _)) => stream,
-                        Err(_) => break,
-                    },
+                    result = endpoint.listener.accept() => match result { Ok((stream, _)) => stream, Err(_) => break },
                 };
-                if !stream
-                    .peer_cred()
-                    .is_ok_and(|credentials| credentials.uid() == uid)
-                {
-                    continue;
-                }
-                // One controlling connection. Additional clients cannot preempt it;
-                // their protocol deadlines must treat an unanswered handshake as unavailable.
+                if !stream.peer_cred().is_ok_and(|credentials| credentials.uid() == uid) { continue; }
+                // A single controlling stream gives requests an unambiguous order.
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => break,
-                    _ = connection(stream, preferences) => {},
+                    _ = connection(stream) => {},
                 }
             }
         });
@@ -236,14 +227,13 @@ mod unix {
     struct Target {
         device: String,
         session: String,
-        sequence: u64,
     }
 
     #[derive(Debug)]
     enum Request {
         Hello,
-        Effect(Target, EffectKind, Duration),
-        Cancel(Target),
+        Set(Target, LedPalette, Duration),
+        Clear(Target),
     }
 
     fn parse(bytes: &[u8]) -> Result<Request, &'static str> {
@@ -258,16 +248,8 @@ mod unix {
         let op = value["op"].as_str().ok_or("invalid-operation")?;
         let allowed: &[&str] = match op {
             "hello" => &["version", "op"],
-            "cancel" => &["version", "op", "device", "session", "sequence"],
-            "effect" => &[
-                "version",
-                "op",
-                "device",
-                "session",
-                "sequence",
-                "effect",
-                "duration_ms",
-            ],
+            "clear" => &["version", "op", "device", "session"],
+            "set" => &["version", "op", "device", "session", "ledColors", "ttl_ms"],
             _ => return Err("invalid-operation"),
         };
         if object.keys().any(|key| !allowed.contains(&key.as_str())) {
@@ -286,48 +268,36 @@ mod unix {
         let target = Target {
             device: identifier("device")?,
             session: identifier("session")?,
-            sequence: value["sequence"]
-                .as_u64()
-                .filter(|n| (1..=9_007_199_254_740_991).contains(n))
-                .ok_or("invalid-sequence")?,
         };
-        if op == "cancel" {
-            return Ok(Request::Cancel(target));
+        if op == "clear" {
+            return Ok(Request::Clear(target));
         }
-        let kind = EffectKind::parse(value["effect"].as_str().ok_or("invalid-effect")?)
-            .ok_or("invalid-effect")?;
-        let millis = value["duration_ms"]
+        let colors = parse_palette(&value).ok_or("invalid-palette")?;
+        let millis = value["ttl_ms"]
             .as_u64()
-            .filter(|n| (125..=kind.max_ms()).contains(n))
-            .ok_or("invalid-duration")?;
-        Ok(Request::Effect(target, kind, Duration::from_millis(millis)))
+            .filter(|n| (125..=MAX_TTL_MS).contains(n))
+            .ok_or("invalid-ttl")?;
+        Ok(Request::Set(target, colors, Duration::from_millis(millis)))
     }
 
     fn error(code: &str) -> Value {
-        json!({"ok": false, "version": 1, "error": code})
+        json!({"ok":false,"version":1,"error":code})
     }
 
-    async fn apply(
-        request: Request,
-        owner: u64,
-        lease: &CancellationToken,
-        preferences: Preferences,
-        sequences: &mut HashMap<(String, String), u64>,
-    ) -> Value {
-        let (target, operation) = match request {
+    async fn apply(request: Request, lease: &CancellationToken) -> Value {
+        let (target, palette) = match request {
             Request::Hello => {
                 let sessions = SESSIONS.read().await;
                 let devices: Vec<_> = sessions
                     .published_outputs()
-                    .take(MAX_SESSIONS)
-                    .map(|(id, output)| json!({"device": id, "session": output.effect_session}))
+                    .take(32)
+                    .map(|(id, output)| json!({"device":id,"session":output.session_id}))
                     .collect();
-                return json!({"ok": true, "version": 1, "effects": ["start", "ready", "stop-mode", "stop-pending", "failure"],
-                    "max_fps": 8, "brightness_cap": preferences.brightness_cap,
-                    "reduced_motion": preferences.reduced_motion, "devices": devices});
+                return json!({"ok":true,"version":1,"operations":["set","clear"],"led_count":24,
+                    "max_hz":8,"max_ttl_ms":MAX_TTL_MS,"devices":devices});
             }
-            Request::Cancel(target) => (target, None),
-            Request::Effect(target, kind, duration) => (target, Some((kind, duration))),
+            Request::Clear(target) => (target, None),
+            Request::Set(target, colors, ttl) => (target, Some((colors, ttl))),
         };
         let output = SESSIONS
             .read()
@@ -335,64 +305,34 @@ mod unix {
             .published_outputs()
             .find(|(id, _)| **id == target.device)
             .map(|(_, output)| output.clone());
-        dispatch(
-            target,
-            operation,
-            output.as_deref(),
-            owner,
-            lease,
-            preferences,
-            sequences,
-        )
+        dispatch(target, palette, output.as_deref(), lease)
     }
 
     fn dispatch(
         target: Target,
-        operation: Option<(EffectKind, Duration)>,
+        palette: Option<(LedPalette, Duration)>,
         output: Option<&crate::device::DeviceOutput>,
-        owner: u64,
         lease: &CancellationToken,
-        preferences: Preferences,
-        sequences: &mut HashMap<(String, String), u64>,
     ) -> Value {
         let Some(output) = output.filter(|output| {
             output.id == target.device
-                && output.effect_session == target.session
+                && output.session_id == target.session
                 && !output.token.is_cancelled()
         }) else {
             return error("stale-or-unknown-session");
         };
-        let key = (target.device, target.session);
-        if sequences
-            .get(&key)
-            .is_some_and(|previous| target.sequence <= *previous)
-        {
-            return error("stale-sequence");
-        }
-        if sequences.len() >= MAX_SESSIONS && !sequences.contains_key(&key) {
-            return error("session-limit");
-        }
-        sequences.insert(key, target.sequence);
-        if let Some((kind, duration)) = operation {
-            let effect = Effect {
-                kind,
-                duration,
-                owner,
-                cancelled: lease.clone(),
-                started: Instant::now(),
-                preferences,
-            };
-            if !effects::submit(&output.effects, effect) {
-                return error("higher-priority-effect");
-            }
-        } else {
-            effects::cancel(&output.effects, owner);
-        }
-        json!({"ok": true, "version": 1, "status": "queued", "sequence": target.sequence})
+        output
+            .external_palette
+            .send_replace(palette.map(|(colors, ttl)| PaletteOverride {
+                colors,
+                expires: Instant::now() + ttl,
+                connection: lease.clone(),
+            }));
+        json!({"ok":true,"version":1,"status":"queued"})
     }
 
     async fn read_frame(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::with_capacity(128);
+        let mut bytes = Vec::with_capacity(384);
         for _ in 0..MAX_FRAME {
             let byte = reader.read_u8().await?;
             bytes.push(byte);
@@ -403,10 +343,8 @@ mod unix {
         Err(io::Error::other("frame-too-large"))
     }
 
-    async fn connection(stream: UnixStream, preferences: Preferences) {
-        let owner = super::NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    async fn connection(stream: UnixStream) {
         let lease = ConnectionLease(CancellationToken::new());
-        let mut sequences = HashMap::new();
         let (read, mut write) = stream.into_split();
         let mut read = BufReader::new(read);
         let mut greeted = false;
@@ -418,11 +356,9 @@ mod unix {
             let reply = match parse(&bytes) {
                 Ok(Request::Hello) => {
                     greeted = true;
-                    apply(Request::Hello, owner, &lease.0, preferences, &mut sequences).await
+                    apply(Request::Hello, &lease.0).await
                 }
-                Ok(request) if greeted => {
-                    apply(request, owner, &lease.0, preferences, &mut sequences).await
-                }
+                Ok(request) if greeted => apply(request, &lease.0).await,
                 Ok(_) => error("hello-required"),
                 Err(code) => error(code),
             };
@@ -434,7 +370,7 @@ mod unix {
             ) {
                 break;
             }
-            sleep(FRAME_INTERVAL).await; // Bound parser/output-request work to 8 messages/s.
+            sleep(UPDATE_INTERVAL).await;
         }
     }
 
@@ -443,159 +379,87 @@ mod unix {
         use super::*;
 
         #[test]
-        fn preferences_are_opt_in_strict_and_bounded() {
-            assert!(preferences(&json!({})).unwrap().is_none());
-            assert!(preferences(&json!({"enabled": false})).unwrap().is_none());
-            assert_eq!(
-                preferences(&json!({"enabled": true}))
-                    .unwrap()
-                    .unwrap()
-                    .brightness_cap,
-                32
-            );
-            for invalid in [
-                json!({"enabled": "yes"}),
-                json!({"enabled": true, "brightness_cap": 65}),
-                json!({"command": "anything"}),
-            ] {
-                assert!(preferences(&invalid).is_err());
-            }
-        }
-
-        #[test]
-        fn parser_rejects_unbounded_unknown_and_raw_control_requests() {
+        fn opt_in_and_protocol_are_strict_and_reuse_existing_palette_format() {
+            assert!(!enabled(&json!({})).unwrap());
+            assert!(enabled(&json!({"enabled":true})).unwrap());
+            assert!(enabled(&json!({"enabled":"yes"})).is_err());
+            assert!(enabled(&json!({"enabled":true,"animation":"anything"})).is_err());
             assert!(matches!(
                 parse(br#"{"version":1,"op":"hello"}"#),
                 Ok(Request::Hello)
             ));
-            let valid = json!({"version":1,"op":"effect","device":"18-test","session":"generation-1","sequence":1,"effect":"stop-mode","duration_ms":10000});
-            assert!(parse(valid.to_string().as_bytes()).is_ok());
+            let valid = json!({"version":1,"op":"set","device":"18-test","session":"generation-1","ttl_ms":1000,"ledColors":vec!["#123456";24]});
+            assert!(matches!(
+                parse(valid.to_string().as_bytes()),
+                Ok(Request::Set(_, _, _))
+            ));
             for (field, value) in [
                 ("version", json!(2)),
-                ("duration_ms", json!(10001)),
-                ("sequence", json!(0)),
-                ("effect", json!("hid")),
+                ("ttl_ms", json!(10001)),
                 ("device", json!("")),
-                ("command", json!("exec")),
+                ("ledColors", json!(["#123456"])),
+                ("op", json!("execute")),
+                ("command", json!("anything")),
             ] {
                 let mut bad = valid.clone();
                 bad[field] = value;
                 assert!(parse(bad.to_string().as_bytes()).is_err(), "{field}");
             }
+            let mut bad = valid.clone();
+            bad["ledColors"][0] = json!("#XYZ123");
+            assert!(parse(bad.to_string().as_bytes()).is_err());
             assert!(parse(&vec![b' '; MAX_FRAME + 1]).is_err());
         }
 
         #[tokio::test]
-        async fn dispatch_binds_session_sequence_priority_and_owner_without_persisting_frames() {
+        async fn external_palettes_and_clear_bind_to_current_device_without_persisting() {
             let _test_guard = crate::palette::TEST_LOCK.lock().await;
-            use tokio::sync::{RwLock, mpsc};
             let id = "18-protocol-test".to_string();
-            let (sender, _receiver) = mpsc::channel(1);
-            let device_token = Arc::new(CancellationToken::new());
+            let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+            let token = Arc::new(CancellationToken::new());
             let output = crate::device::DeviceOutput::new(
                 id.clone(),
-                device_token.clone(),
-                Arc::new(RwLock::new(())),
+                token.clone(),
+                Arc::new(tokio::sync::RwLock::new(())),
                 sender,
             );
             let base = [[3, 4, 5]; 24];
             crate::palette::PALETTES.lock().await.select(&id, base);
-            let preferences = Preferences {
-                reduced_motion: true,
-                brightness_cap: 32,
-            };
             let lease = CancellationToken::new();
-            let mut sequences = HashMap::new();
-            let target = |sequence| Target {
+            let target = || Target {
                 device: id.clone(),
-                session: output.effect_session.clone(),
-                sequence,
+                session: output.session_id.clone(),
             };
-            let stop = Some((EffectKind::StopMode, Duration::from_secs(10)));
+            let colors = std::array::from_fn(|i| [i as u8, 120, 255]);
             assert_eq!(
                 dispatch(
-                    target(1),
-                    stop,
+                    target(),
+                    Some((colors, Duration::from_secs(1))),
                     Some(&output),
-                    7,
-                    &lease,
-                    preferences,
-                    &mut sequences
+                    &lease
                 )["status"],
                 "queued"
             );
             assert_eq!(
-                dispatch(
-                    target(1),
-                    None,
-                    Some(&output),
-                    7,
-                    &lease,
-                    preferences,
-                    &mut sequences
-                )["error"],
-                "stale-sequence"
+                output.external_palette.borrow().as_ref().unwrap().colors,
+                colors
             );
+            let mut stale = target();
+            stale.session = "old-generation".into();
             assert_eq!(
-                dispatch(
-                    target(2),
-                    Some((EffectKind::Ready, Duration::from_secs(1))),
-                    Some(&output),
-                    7,
-                    &lease,
-                    preferences,
-                    &mut sequences
-                )["error"],
-                "higher-priority-effect"
-            );
-            assert_eq!(
-                output.effects.borrow().as_ref().unwrap().kind,
-                EffectKind::StopMode
-            );
-            dispatch(
-                target(3),
-                None,
-                Some(&output),
-                8,
-                &lease,
-                preferences,
-                &mut sequences,
-            );
-            assert!(output.effects.borrow().is_some()); // A stale other owner cannot cancel.
-            dispatch(
-                target(4),
-                None,
-                Some(&output),
-                7,
-                &lease,
-                preferences,
-                &mut sequences,
-            );
-            assert!(output.effects.borrow().is_none());
-            let mut stale = target(5);
-            stale.session = "prior-generation".into();
-            assert_eq!(
-                dispatch(
-                    stale,
-                    stop,
-                    Some(&output),
-                    7,
-                    &lease,
-                    preferences,
-                    &mut sequences
-                )["error"],
+                dispatch(stale, None, Some(&output), &lease)["error"],
                 "stale-or-unknown-session"
             );
-            device_token.cancel();
+            assert!(output.external_palette.borrow().is_some());
+            dispatch(target(), None, Some(&output), &lease);
+            assert!(output.external_palette.borrow().is_none());
+            token.cancel();
             assert_eq!(
                 dispatch(
-                    target(5),
-                    stop,
+                    target(),
+                    Some((colors, Duration::from_secs(1))),
                     Some(&output),
-                    7,
-                    &lease,
-                    preferences,
-                    &mut sequences
+                    &lease
                 )["error"],
                 "stale-or-unknown-session"
             );
@@ -603,15 +467,9 @@ mod unix {
         }
 
         #[tokio::test]
-        async fn framing_is_bounded_and_connection_loss_revokes_effect_lease() {
+        async fn framing_and_disconnect_are_bounded() {
             let (client, server) = UnixStream::pair().unwrap();
-            let task = tokio::spawn(connection(
-                server,
-                Preferences {
-                    reduced_motion: true,
-                    brightness_cap: 32,
-                },
-            ));
+            let task = tokio::spawn(connection(server));
             let (read, mut write) = client.into_split();
             write
                 .write_all(b"{\"version\":1,\"op\":\"hello\"}\n")
@@ -620,8 +478,8 @@ mod unix {
             let mut read = BufReader::new(read);
             let reply = read_frame(&mut read).await.unwrap();
             assert_eq!(
-                serde_json::from_slice::<Value>(&reply).unwrap()["max_fps"],
-                8
+                serde_json::from_slice::<Value>(&reply).unwrap()["led_count"],
+                24
             );
             drop(read);
             drop(write);
@@ -631,7 +489,7 @@ mod unix {
                 .unwrap();
             let token = CancellationToken::new();
             {
-                let _lease = ConnectionLease(token.clone());
+                let _guard = ConnectionLease(token.clone());
             }
             assert!(token.is_cancelled());
             let mut oversized = &vec![b'x'; MAX_FRAME + 1][..];
@@ -642,7 +500,7 @@ mod unix {
         async fn endpoint_refuses_unsafe_directory_and_existing_socket() {
             // SAFETY: read-only process uid lookup.
             let uid = unsafe { libc::geteuid() };
-            let root = PathBuf::from("/tmp").join(super::super::new_session_id());
+            let root = PathBuf::from("/tmp").join(new_session_id());
             fs::create_dir(&root).unwrap();
             let endpoint = Endpoint::bind(root.clone(), uid).unwrap();
             assert_eq!(
@@ -651,8 +509,11 @@ mod unix {
             );
             assert!(Endpoint::bind(root.clone(), uid).is_err());
             drop(endpoint);
-            let directory = root.join(".opendeck-m18");
-            fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(
+                root.join(".opendeck-m18"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
             assert!(Endpoint::bind(root.clone(), uid).is_err());
             fs::remove_dir_all(root).unwrap();
         }

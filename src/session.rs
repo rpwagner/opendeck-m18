@@ -149,7 +149,7 @@ impl<D, O> SessionRegistry<D, O> {
         }
     }
 
-    /// Only fully published, live generations may accept external effect requests.
+    /// Only fully published, live generations may accept external palette requests.
     #[cfg(any(unix, test))]
     pub fn published_outputs(&self) -> impl Iterator<Item = (&String, &O)> {
         self.registrations.iter().filter_map(|(id, registration)| {
@@ -223,11 +223,11 @@ impl<D, O> SessionRegistry<D, O> {
 }
 
 #[cfg(test)]
-mod effect_tests {
+mod control_tests {
     use super::*;
 
     #[test]
-    fn effects_discover_only_published_current_sessions() {
+    fn external_control_discovers_only_published_current_sessions() {
         let mut sessions = SessionRegistry::default();
         let token = sessions.reserve("18-test".into(), 1).unwrap();
         assert_eq!(sessions.published_outputs().count(), 0);

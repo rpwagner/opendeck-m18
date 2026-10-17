@@ -28,12 +28,12 @@ The M18 has:
 
 Add the **Set LED Colors** action to a keypad button to configure the M18's 24 RGB LEDs. Its Property Inspector follows the physical LED layout and can set each LED independently or apply one color to all LEDs.
 
-## Temporary LED effects (this fork)
+## External LED palette control
 
-An opt-in same-user interface can request bounded Start, Ready and Stop-mode
-lighting through this plugin's existing device worker. See [LED_EFFECTS.md](LED_EFFECTS.md)
-for setup, protocol, ownership, limits and pending physical-device validation.
-It does not require an OpenDeck patch or change saved-palette ownership.
+An opt-in local interface allows other applications to set a temporary palette
+for the 24 LEDs through the existing device worker. See [LED_CONTROL.md](LED_CONTROL.md)
+for configuration, protocol and limits. The existing Set LED Colors action keeps
+ownership of the saved resting palette.
 
 ## Platform support
 

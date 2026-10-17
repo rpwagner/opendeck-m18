@@ -17,7 +17,6 @@ use watcher::watcher_task;
 use tokio::signal::unix::{SignalKind, signal};
 
 mod device;
-mod effects;
 mod inputs;
 mod led_ipc;
 mod mappings;
@@ -94,7 +93,7 @@ impl global_events::GlobalEventHandler for GlobalEventHandler {
             (pending, store.saved_palettes().clone())
         };
         // Never hold the palette lock while awaiting the bounded output queue:
-        // its worker reads that same owner before rendering a temporary frame.
+        // its worker reads that same owner before rendering a external palette.
         for (id, colors) in palettes {
             let output = SESSIONS.read().await.output(&id).cloned();
             if let Some(output) = output
