@@ -5,7 +5,7 @@ use image::{DynamicImage, load_from_memory_with_format};
 use mirajazz::{device::Device, error::MirajazzError, types::DeviceInput};
 use openaction::{device_plugin, global_events::SetImageEvent};
 use tokio::{
-    sync::{RwLock, mpsc},
+    sync::{RwLock, mpsc, watch},
     time::{Instant, MissedTickBehavior, interval, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     SESSIONS,
     inputs::{ButtonEvent, ButtonSession, opendeck_to_device},
+    led_ipc::{PaletteOverride, UPDATE_INTERVAL},
     mappings::{
         COL_COUNT, CandidateDevice, ENCODER_COUNT, KEY_COUNT, Kind, ROW_COUNT,
         get_image_format_for_key,
@@ -34,9 +35,29 @@ pub struct DeviceOutput {
     pub token: Arc<CancellationToken>,
     input_gate: Arc<RwLock<()>>,
     sender: mpsc::Sender<DeviceCommand>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub session_id: String,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub external_palette: watch::Sender<Option<PaletteOverride>>,
 }
 
 impl DeviceOutput {
+    pub(crate) fn new(
+        id: String,
+        token: Arc<CancellationToken>,
+        input_gate: Arc<RwLock<()>>,
+        sender: mpsc::Sender<DeviceCommand>,
+    ) -> Self {
+        Self {
+            id,
+            token,
+            input_gate,
+            sender,
+            session_id: crate::led_ipc::new_session_id(),
+            external_palette: watch::channel(None).0,
+        }
+    }
+
     pub async fn send(&self, command: DeviceCommand) -> Result<(), ()> {
         self.sender.send(command).await.map_err(|_| ())
     }
@@ -75,12 +96,13 @@ pub async fn device_task(candidate: CandidateDevice, token: Arc<CancellationToke
     let device = Arc::new(device);
     let (sender, receiver) = mpsc::channel(128);
     let input_session = ButtonSession::new();
-    let output = Arc::new(DeviceOutput {
-        id: candidate.id.clone(),
-        token: token.clone(),
-        input_gate: input_session.gate(),
+    let output = Arc::new(DeviceOutput::new(
+        candidate.id.clone(),
+        token.clone(),
+        input_session.gate(),
         sender,
-    });
+    ));
+    let palette_receiver = output.external_palette.subscribe();
 
     match publish_device_if_current(&candidate, &device, &output, &token).await {
         PublicationOutcome::Published => {}
@@ -101,6 +123,7 @@ pub async fn device_task(candidate: CandidateDevice, token: Arc<CancellationToke
         candidate.kind.clone(),
         device.clone(),
         receiver,
+        palette_receiver,
         token.clone(),
     ));
 
@@ -467,6 +490,7 @@ enum OutputAction {
     Command(Option<DeviceCommand>),
     Flush,
     KeepAlive,
+    Leds,
     Cancel,
 }
 
@@ -535,6 +559,7 @@ async fn device_output_task<D: OutputDevice + 'static>(
     kind: Kind,
     device: Arc<D>,
     mut receiver: mpsc::Receiver<DeviceCommand>,
+    external_palette: watch::Receiver<Option<PaletteOverride>>,
     token: Arc<CancellationToken>,
 ) -> Result<(), MirajazzError> {
     let mut keepalive = interval(Duration::from_secs(10));
@@ -544,6 +569,10 @@ async fn device_output_task<D: OutputDevice + 'static>(
         log::info!("Restoring LED palette for {}", id);
         device.set_led_colors(&colors).await?;
     }
+    let mut base = saved.unwrap_or(crate::palette::DEFAULT_PALETTE);
+    let mut last_leds = saved;
+    let mut leds_owned = saved.is_some();
+    let mut next_led = Instant::now() + UPDATE_INTERVAL;
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Skip);
     keepalive.tick().await;
 
@@ -557,6 +586,7 @@ async fn device_output_task<D: OutputDevice + 'static>(
             biased;
             _ = token.cancelled() => OutputAction::Cancel,
             _ = sleep_until(flush_at), if flush_deadline.is_some() => OutputAction::Flush,
+            _ = sleep_until(next_led) => OutputAction::Leds,
             command = receiver.recv() => OutputAction::Command(command),
             _ = keepalive.tick() => OutputAction::KeepAlive,
         };
@@ -587,11 +617,47 @@ async fn device_output_task<D: OutputDevice + 'static>(
                 .set_brightness(brightness)
                 .await
                 .map(|_| OutputStep::Continue),
-            OutputAction::Command(Some(DeviceCommand::SetLedColors(colors))) => device
-                .set_led_colors(&colors)
-                .await
-                .map(|_| OutputStep::Continue),
-            OutputAction::Command(None) | OutputAction::Cancel => Ok(OutputStep::Stop),
+            OutputAction::Command(Some(DeviceCommand::SetLedColors(colors))) => {
+                base = colors;
+                leds_owned = true;
+                Ok(OutputStep::Continue)
+            }
+            OutputAction::Leds => {
+                // Read the palette owner at render time: a manual selection made
+                // during an override must be the palette restored afterward.
+                base = crate::palette::PALETTES
+                    .lock()
+                    .await
+                    .get(&id)
+                    .unwrap_or(base);
+                let current = external_palette.borrow().clone();
+                leds_owned |= current.is_some();
+                let frame = current
+                    .as_ref()
+                    .map_or(base, |palette| palette.palette(base, Instant::now()));
+                let result = if leds_owned && Some(frame) != last_leds {
+                    device.set_led_colors(&frame).await.map(|_| {
+                        last_leds = Some(frame);
+                        OutputStep::Continue
+                    })
+                } else {
+                    Ok(OutputStep::Continue)
+                };
+                // Schedule after each write; never catch up with a burst of frames.
+                next_led = Instant::now() + UPDATE_INTERVAL;
+                result
+            }
+            OutputAction::Command(None) | OutputAction::Cancel => {
+                base = crate::palette::PALETTES
+                    .lock()
+                    .await
+                    .get(&id)
+                    .unwrap_or(base);
+                if leds_owned && last_leds != Some(base) {
+                    device.set_led_colors(&base).await?;
+                }
+                Ok(OutputStep::Stop)
+            }
             OutputAction::Flush => {
                 log::debug!("Flushing pending updates for {}", id);
                 device.flush().await.map(|_| OutputStep::ClearFlush)
@@ -639,5 +705,237 @@ pub fn command_for_set_image(evt: SetImageEvent) -> Result<Option<DeviceCommand>
         (Some(position), None) => Ok(Some(DeviceCommand::ClearImage(position))),
         (None, None) => Ok(Some(DeviceCommand::ClearAll)),
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod led_tests {
+    use super::*;
+    use std::sync::{
+        Mutex as StdMutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Default)]
+    struct RecordingDevice {
+        leds: StdMutex<Vec<(Instant, LedPalette)>>,
+        images: AtomicUsize,
+        flushes: AtomicUsize,
+    }
+    impl OutputDevice for RecordingDevice {
+        async fn set_button_image(
+            &self,
+            _: u8,
+            _: mirajazz::types::ImageFormat,
+            _: DynamicImage,
+        ) -> Result<(), MirajazzError> {
+            self.images.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        async fn clear_button_image(&self, _: u8) -> Result<(), MirajazzError> {
+            Ok(())
+        }
+        async fn clear_all_button_images(&self) -> Result<(), MirajazzError> {
+            Ok(())
+        }
+        async fn set_brightness(&self, _: u8) -> Result<(), MirajazzError> {
+            Ok(())
+        }
+        async fn set_led_colors(&self, colors: &[[u8; 3]]) -> Result<(), MirajazzError> {
+            self.leds
+                .lock()
+                .unwrap()
+                .push((Instant::now(), colors.try_into().unwrap()));
+            Ok(())
+        }
+        async fn flush(&self) -> Result<(), MirajazzError> {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        async fn keep_alive(&self) -> Result<(), MirajazzError> {
+            Ok(())
+        }
+    }
+    async fn tick() {
+        tokio::time::sleep(UPDATE_INTERVAL + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+    }
+    fn palette(
+        colors: LedPalette,
+        ttl: Duration,
+        connection: CancellationToken,
+    ) -> PaletteOverride {
+        PaletteOverride {
+            colors,
+            expires: Instant::now() + ttl,
+            connection,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overrides_restore_latest_manual_palette_on_clear_expiry_disconnect_and_shutdown() {
+        let _guard = crate::palette::TEST_LOCK.lock().await;
+        let id = crate::led_ipc::new_session_id();
+        let original = [[1, 2, 3]; 24];
+        crate::palette::PALETTES.lock().await.select(&id, original);
+        let (sender, receiver) = mpsc::channel(128);
+        let (external, palettes) = watch::channel(None);
+        let token = Arc::new(CancellationToken::new());
+        let connection = CancellationToken::new();
+        let device = Arc::new(RecordingDevice::default());
+        let worker = tokio::spawn(device_output_task(
+            id.clone(),
+            Kind::VsdInsideM18,
+            device.clone(),
+            receiver,
+            palettes,
+            token.clone(),
+        ));
+        tokio::task::yield_now().await;
+        let colors = std::array::from_fn(|i| [i as u8, 120, 255]);
+        external.send_replace(Some(palette(
+            colors,
+            Duration::from_secs(5),
+            connection.clone(),
+        )));
+        tick().await;
+        assert_eq!(device.leds.lock().unwrap().last().unwrap().1, colors);
+        let changed = [[12, 13, 14]; 24];
+        crate::palette::PALETTES.lock().await.select(&id, changed);
+        sender
+            .send(DeviceCommand::SetLedColors(changed))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tick().await;
+        assert_eq!(device.leds.lock().unwrap().len(), 2); // Manual update does not repaint an unchanged override.
+        external.send_replace(None);
+        tick().await;
+        assert_eq!(device.leds.lock().unwrap().last().unwrap().1, changed);
+        external.send_replace(Some(palette(
+            colors,
+            Duration::from_millis(250),
+            connection.clone(),
+        )));
+        tick().await;
+        assert_eq!(device.leds.lock().unwrap().last().unwrap().1, colors);
+        // Expiry is observed by the next sample, at most one interval later.
+        tick().await;
+        tick().await;
+        assert_eq!(device.leds.lock().unwrap().last().unwrap().1, changed);
+        external.send_replace(Some(palette(
+            colors,
+            Duration::from_secs(5),
+            connection.clone(),
+        )));
+        tick().await;
+        connection.cancel();
+        tick().await;
+        assert_eq!(device.leds.lock().unwrap().last().unwrap().1, changed);
+        let count = device.leds.lock().unwrap().len();
+        for _ in 0..8 {
+            tick().await;
+        }
+        assert_eq!(device.leds.lock().unwrap().len(), count);
+        external.send_replace(Some(palette(
+            colors,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )));
+        tick().await;
+        let latest = [[7, 8, 9]; 24];
+        crate::palette::PALETTES.lock().await.select(&id, latest);
+        token.cancel();
+        worker.await.unwrap().unwrap();
+        assert_eq!(device.leds.lock().unwrap().last().unwrap().1, latest);
+        assert_eq!(crate::palette::PALETTES.lock().await.get(&id), Some(latest));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_frames_coalesce_are_rate_limited_and_preserve_lcd_flushes() {
+        let _guard = crate::palette::TEST_LOCK.lock().await;
+        let (sender, receiver) = mpsc::channel(128);
+        let (external, palettes) = watch::channel(None);
+        let token = Arc::new(CancellationToken::new());
+        let device = Arc::new(RecordingDevice::default());
+        let worker = tokio::spawn(device_output_task(
+            crate::led_ipc::new_session_id(),
+            Kind::VsdInsideM18,
+            device.clone(),
+            receiver,
+            palettes,
+            token.clone(),
+        ));
+        tokio::task::yield_now().await;
+        for n in 0..100 {
+            external.send_replace(Some(palette(
+                [[n, 0, 0]; 24],
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )));
+        }
+        sender
+            .send(DeviceCommand::SetImage {
+                position: 0,
+                image: DynamicImage::new_rgb8(64, 64),
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tick().await;
+        assert_eq!(device.leds.lock().unwrap().len(), 1);
+        assert_eq!(device.leds.lock().unwrap()[0].1, [[99, 0, 0]; 24]);
+        for n in 0..7 {
+            external.send_replace(Some(palette(
+                [[n, 20, 30]; 24],
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )));
+            tick().await;
+        }
+        let writes = device.leds.lock().unwrap().clone();
+        assert_eq!(writes.len(), 8);
+        assert!(
+            writes
+                .windows(2)
+                .all(|pair| pair[1].0 - pair[0].0 >= UPDATE_INTERVAL)
+        );
+        assert_eq!(device.images.load(Ordering::Relaxed), 1);
+        assert!(device.flushes.load(Ordering::Relaxed) >= 1);
+        token.cancel();
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_external_client_means_no_new_unsaved_idle_palette_writes() {
+        let _guard = crate::palette::TEST_LOCK.lock().await;
+        let (sender, receiver) = mpsc::channel(128);
+        let (_external, palettes) = watch::channel(None);
+        let token = Arc::new(CancellationToken::new());
+        let device = Arc::new(RecordingDevice::default());
+        let worker = tokio::spawn(device_output_task(
+            crate::led_ipc::new_session_id(),
+            Kind::VsdInsideM18,
+            device.clone(),
+            receiver,
+            palettes,
+            token.clone(),
+        ));
+        tokio::task::yield_now().await;
+        tick().await;
+        assert!(device.leds.lock().unwrap().is_empty());
+        let manual = [[18, 20, 22]; 24];
+        for _ in 0..2 {
+            sender
+                .send(DeviceCommand::SetLedColors(manual))
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            tick().await;
+        }
+        assert_eq!(device.leds.lock().unwrap().len(), 1);
+        assert_eq!(device.leds.lock().unwrap()[0].1, manual);
+        token.cancel();
+        worker.await.unwrap().unwrap();
     }
 }

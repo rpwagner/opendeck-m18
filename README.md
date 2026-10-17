@@ -28,6 +28,13 @@ The M18 has:
 
 Add the **Set LED Colors** action to a keypad button to configure the M18's 24 RGB LEDs. Its Property Inspector follows the physical LED layout and can set each LED independently or apply one color to all LEDs.
 
+## External LED palette control
+
+An opt-in local interface allows other applications to set a temporary palette
+for the 24 LEDs through the existing device worker. See [LED_CONTROL.md](LED_CONTROL.md)
+for configuration, protocol and limits. The existing Set LED Colors action keeps
+ownership of the saved resting palette.
+
 ## Platform support
 
 - Linux (x86-64 and ARM64): Primary development platform

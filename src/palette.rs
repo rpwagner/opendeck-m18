@@ -118,3 +118,7 @@ fn palette_strings(palette: &LedPalette) -> Vec<String> {
         .collect()
 }
 
+// Paused-time worker tests share this process-wide palette owner. Serialize
+// those exercises so a different test runtime cannot advance a blocked worker.
+#[cfg(test)]
+pub static TEST_LOCK: Mutex<()> = Mutex::const_new(());

@@ -513,6 +513,7 @@ dependencies = [
  "data-url",
  "futures-lite",
  "image",
+ "libc",
  "log",
  "mirajazz",
  "openaction",
