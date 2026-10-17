@@ -149,6 +149,20 @@ impl<D, O> SessionRegistry<D, O> {
         }
     }
 
+    /// Only fully published, live generations may accept external effect requests.
+    #[cfg(any(unix, test))]
+    pub fn published_outputs(&self) -> impl Iterator<Item = (&String, &O)> {
+        self.registrations.iter().filter_map(|(id, registration)| {
+            if registration.token.is_cancelled() {
+                return None;
+            }
+            match &registration.phase {
+                SessionPhase::Published { output, .. } => Some((id, output)),
+                _ => None,
+            }
+        })
+    }
+
     pub fn begin_removal(&mut self, id: &str, expected: SessionMatch<'_>) -> Option<Removal<D, O>> {
         let registered = self.registrations.get_mut(id)?;
         let matches = match expected {
@@ -205,5 +219,40 @@ impl<D, O> SessionRegistry<D, O> {
         for registration in self.registrations.values() {
             registration.token.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod effect_tests {
+    use super::*;
+
+    #[test]
+    fn effects_discover_only_published_current_sessions() {
+        let mut sessions = SessionRegistry::default();
+        let token = sessions.reserve("18-test".into(), 1).unwrap();
+        assert_eq!(sessions.published_outputs().count(), 0);
+        sessions
+            .begin_registration("18-test", &token, (), "old-output")
+            .unwrap();
+        assert_eq!(sessions.published_outputs().count(), 0);
+        assert!(sessions.finish_registration("18-test", &token));
+        assert_eq!(
+            sessions.published_outputs().next().unwrap().1,
+            &"old-output"
+        );
+        token.cancel();
+        assert_eq!(sessions.published_outputs().count(), 0);
+        sessions.begin_removal("18-test", SessionMatch::Token(&token));
+        sessions.finish_cleanup("18-test", &token);
+        let replacement = sessions.reserve("18-test".into(), 2).unwrap();
+        sessions
+            .begin_registration("18-test", &replacement, (), "new-output")
+            .unwrap();
+        sessions.finish_registration("18-test", &replacement);
+        assert!(!sessions.is_current("18-test", &token));
+        assert_eq!(
+            sessions.published_outputs().next().unwrap().1,
+            &"new-output"
+        );
     }
 }

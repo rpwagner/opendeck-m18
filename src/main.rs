@@ -17,7 +17,9 @@ use watcher::watcher_task;
 use tokio::signal::unix::{SignalKind, signal};
 
 mod device;
+mod effects;
 mod inputs;
+mod led_ipc;
 mod mappings;
 mod palette;
 mod session;
@@ -67,6 +69,7 @@ impl global_events::GlobalEventHandler for GlobalEventHandler {
         CONNECTION_READY.store(true, Ordering::Release);
         get_global_settings().await?;
         let tracker = TRACKER.lock().await.clone();
+        led_ipc::start(&tracker).await;
 
         let token = Arc::new(CancellationToken::new());
         tracker.spawn(watcher_task(token.clone()));
@@ -85,21 +88,29 @@ impl global_events::GlobalEventHandler for GlobalEventHandler {
         &self,
         event: global_events::DidReceiveGlobalSettingsEvent,
     ) -> OpenActionResult<()> {
-        let mut store = palette::PALETTES.lock().await;
-        let pending = store.load(event.payload.settings);
-        for (id, colors) in store.saved_palettes() {
-            let output = SESSIONS.read().await.output(id).cloned();
+        let (pending, palettes) = {
+            let mut store = palette::PALETTES.lock().await;
+            let pending = store.load(event.payload.settings);
+            (pending, store.saved_palettes().clone())
+        };
+        // Never hold the palette lock while awaiting the bounded output queue:
+        // its worker reads that same owner before rendering a temporary frame.
+        for (id, colors) in palettes {
+            let output = SESSIONS.read().await.output(&id).cloned();
             if let Some(output) = output
                 && output
-                    .send(DeviceCommand::SetLedColors(*colors))
+                    .send(DeviceCommand::SetLedColors(colors))
                     .await
                     .is_err()
             {
                 output.token.cancel();
             }
         }
-        if pending && let Some(settings) = store.settings_to_save() {
-            set_global_settings(settings).await?;
+        if pending {
+            let store = palette::PALETTES.lock().await;
+            if let Some(settings) = store.settings_to_save() {
+                set_global_settings(settings).await?;
+            }
         }
         Ok(())
     }
@@ -175,9 +186,13 @@ async fn apply_palette(instance: &Instance, settings: &serde_json::Value) {
         return;
     };
 
-    let mut store = palette::PALETTES.lock().await;
-    store.select(&instance.device_id, palette);
+    palette::PALETTES
+        .lock()
+        .await
+        .select(&instance.device_id, palette);
     send_device_command(&instance.device_id, DeviceCommand::SetLedColors(palette)).await;
+    // Save the current owner snapshot after the queue wait, not a stale copy.
+    let store = palette::PALETTES.lock().await;
     if let Some(settings) = store.settings_to_save()
         && let Err(error) = set_global_settings(settings).await
     {
